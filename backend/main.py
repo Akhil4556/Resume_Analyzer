@@ -1,16 +1,22 @@
 import os
 import uuid
+import json
 import boto3
 import pdfplumber
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-from starlette.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import InferenceClient
 
 load_dotenv()
 
 app = FastAPI()
+
+# ==========================
+# CORS
+# ==========================
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,24 +26,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================
+# CONFIG
+# ==========================
+
 S3_BUCKET = "rezum.analyzer"
-client = InferenceClient(api_key=os.getenv("API_KEY"))
+
+hf_client = InferenceClient(
+    api_key=os.getenv("API_KEY")
+)
+
+# ==========================
+# HOME API
+# ==========================
 
 @app.get("/")
 def home():
-    return {"message": "AI Resume Analyzer Backend Running"}
+    return {
+        "message": "AI Resume Analyzer Backend Running"
+    }
+
+# ==========================
+# RESUME ANALYZER API
+# ==========================
 
 @app.post("/upload-resume/")
 async def upload_resume(file: UploadFile = File(...)):
+
     s3_client = boto3.client(
         "s3",
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         region_name="ap-south-1"
     )
+
     s3_key = None
+    temp_file = None
+
     try:
+
+        # ==========================
+        # Upload PDF to S3
+        # ==========================
+
         file_content = await file.read()
+
         s3_key = f"resumes/{uuid.uuid4().hex}.pdf"
 
         s3_client.put_object(
@@ -47,51 +80,144 @@ async def upload_resume(file: UploadFile = File(...)):
             ContentType="application/pdf"
         )
 
+        # ==========================
+        # Download PDF from S3
+        # ==========================
+
         temp_file = f"temp_{uuid.uuid4().hex}.pdf"
-        s3_client.download_file(S3_BUCKET, s3_key, temp_file)
+
+        s3_client.download_file(
+            S3_BUCKET,
+            s3_key,
+            temp_file
+        )
+
+        # ==========================
+        # Extract Text
+        # ==========================
 
         extracted_text = ""
+
         with pdfplumber.open(temp_file) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
+
                 if text:
                     extracted_text += text + "\n"
 
+        # Remove temp file
         os.remove(temp_file)
 
+        # ==========================
+        # AI Prompt
+        # ==========================
+
         prompt = f"""
-Analyze this resume and provide:
-1. Resume Score (0-100)
-2. Top Strengths
-3. Missing Skills
-4. Improvement Suggestions
-5. Career Recommendations
+Analyze this resume and return ONLY valid JSON.
+
+{{
+    "score": 0,
+    "strengths": [],
+    "missing_skills": [],
+    "suggestions": [],
+    "career_recommendations": []
+}}
 
 Resume:
-{extracted_text[:1500]}
+
+{extracted_text[:2000]}
 """
-        response = client.chat_completion(
+
+        # ==========================
+        # Hugging Face
+        # ==========================
+
+        response = hf_client.chat_completion(
             model="meta-llama/Llama-3.1-8B-Instruct",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
         )
 
         ai_feedback = response.choices[0].message.content
 
-        s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+        print("\n========== AI RESPONSE ==========")
+        print(ai_feedback)
+        print("=================================\n")
+
+        # ==========================
+        # Parse JSON
+        # ==========================
+
+        try:
+
+            start = ai_feedback.find("{")
+            end = ai_feedback.rfind("}") + 1
+
+            json_text = ai_feedback[start:end]
+
+            parsed_data = json.loads(json_text)
+
+        except Exception:
+
+            parsed_data = {
+                "score": 0,
+                "strengths": [],
+                "missing_skills": [],
+                "suggestions": [],
+                "career_recommendations": []
+            }
+
+        # ==========================
+        # Delete Resume From S3
+        # ==========================
+
+        s3_client.delete_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key
+        )
+
+        # ==========================
+        # Return JSON
+        # ==========================
 
         return JSONResponse(
             content={
                 "filename": file.filename,
-                "resume_text": extracted_text[:1000],
-                "ai_feedback": ai_feedback
-            },
-            headers={"Access-Control-Allow-Origin": "*"}
+                "score": parsed_data.get("score", 0),
+                "strengths": parsed_data.get("strengths", []),
+                "missing_skills": parsed_data.get("missing_skills", []),
+                "suggestions": parsed_data.get("suggestions", []),
+                "career_recommendations": parsed_data.get(
+                    "career_recommendations",
+                    []
+                )
+            }
         )
 
     except Exception as e:
-        if s3_key:
-            s3_client.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+
+        try:
+            if temp_file and os.path.exists(temp_file):
+                os.remove(temp_file)
+        except:
+            pass
+
+        try:
+            if s3_key:
+                s3_client.delete_object(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key
+                )
+        except:
+            pass
+
         return JSONResponse(
-            content={"error": str(e)},
-            headers={"Access-Control-Allow-Origin": "*"}
+            content={
+                "error": str(e)
+            },
+            status_code=500
         )
